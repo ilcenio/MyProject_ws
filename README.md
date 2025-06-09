@@ -1,6 +1,5 @@
-# ros2-labs-05
-This repository contains the material seen in the ros2-labs-01 lesson. <br>
-In particular contains the basic workspace that we'll use during this course.
+# ros2-labs-07
+
 
 ## Description
 
