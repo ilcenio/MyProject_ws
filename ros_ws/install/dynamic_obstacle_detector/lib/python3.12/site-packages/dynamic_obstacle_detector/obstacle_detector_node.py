@@ -4,10 +4,13 @@ from sensor_msgs.msg import LaserScan
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PointStamped
 import math
 import struct
 import numpy as np
+import tf2_ros
+from tf2_ros import TransformException
+import tf2_geometry_msgs
 
 class TrackedObstacle:
     """
@@ -95,13 +98,15 @@ class ObstacleDetectorNode(Node):
         self.declare_parameter('kf.p', [0.1, 0.1, 10.0, 10.0])
         self.declare_parameter('kf.r', [0.1, 0.1])
         self.declare_parameter('kf.q', [0.01, 0.01, 0.1, 0.1])
+        self.declare_parameter('target_frame', 'odom')
 
         # --- Lettura dei Parametri ---
         self.MAX_TRACKING_DISTANCE = self.get_parameter('max_tracking_distance').get_parameter_value().double_value
         self.TRACK_LIFETIME = self.get_parameter('track_lifetime').get_parameter_value().double_value
         self.PREDICTION_HORIZON = self.get_parameter('prediction_horizon').get_parameter_value().double_value
         self.PREDICTION_STEPS = self.get_parameter('prediction_steps').get_parameter_value().integer_value
-
+        self.TARGET_FRAME = self.get_parameter('target_frame').get_parameter_value().string_value
+        
         # Memorizziamo i parametri del KF per passarli ai nuovi track
         self.kf_params = {
             'p': self.get_parameter('kf.p').get_parameter_value().double_array_value,
@@ -112,6 +117,10 @@ class ObstacleDetectorNode(Node):
         # Strutture dati per il tracking
         self.tracked_obstacles = {}  # Dizionario {track_id: TrackedObstacle}
         self.next_obstacle_id = 0
+
+        # TF2 Buffer e Listener per le trasformazioni di coordinate
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # Creiamo un subscriber per il topic /scan.
         self.subscription = self.create_subscription(
@@ -138,29 +147,58 @@ class ObstacleDetectorNode(Node):
         """
         Questa funzione viene chiamata ogni volta che arriva un nuovo messaggio LaserScan.
         """
-        # 1. Rileva i cluster di punti dal LaserScan
+        # --- Trasformazione dei Punti nel Frame Fisso ---
+        try:
+            # Chiediamo la trasformazione tra il frame del laser (es. 'base_scan') e il nostro frame target ('odom')
+            # Usiamo rclpy.time.Time() per ottenere la trasformazione più recente disponibile.
+            transform = self.tf_buffer.lookup_transform(
+                self.TARGET_FRAME,
+                msg.header.frame_id,
+                rclpy.time.Time())
+        except TransformException as ex:
+            self.get_logger().warn(f'Non è stato possibile trasformare {msg.header.frame_id} in {self.TARGET_FRAME}: {ex}')
+            return
+
+        # 1. Rileva i cluster di punti dal LaserScan (in coordinate polari)
         polar_clusters = self.cluster_scan(msg)
 
-        # 2. Converte i cluster da coordinate polari a cartesiane
-        cartesian_clusters = []
+        # 2. Converte i cluster in coordinate cartesiane NEL FRAME TARGET ('odom')
+        cartesian_clusters_odom = []
         for cluster in polar_clusters:
-            cart_cluster = []
+            cart_cluster_odom = []
             for r, theta in cluster:
-                x = r * math.cos(theta)
-                y = r * math.sin(theta)
-                cart_cluster.append((x, y, 0.0))
-            cartesian_clusters.append(cart_cluster)
+                # Crea un punto nel frame del laser
+                point_in_laser_frame = PointStamped()
+                point_in_laser_frame.header = msg.header
+                # Converte da polare a cartesiano (nel frame del laser)
+                point_in_laser_frame.point.x = r * math.cos(theta)
+                point_in_laser_frame.point.y = r * math.sin(theta)
+                point_in_laser_frame.point.z = 0.0
+
+                # Trasforma il punto dal frame del laser al frame target ('odom')
+                point_in_odom_frame = tf2_geometry_msgs.do_transform_point(point_in_laser_frame, transform)
+            
+                cart_cluster_odom.append((point_in_odom_frame.point.x, point_in_odom_frame.point.y, 0.0))
+        
+            if cart_cluster_odom:
+                cartesian_clusters_odom.append(cart_cluster_odom)
         
         # 3. Aggiorna i track, predici le traiettorie e pubblica
-        self.update_tracks_and_publish(cartesian_clusters, msg.header)
+        self.update_tracks_and_publish(cartesian_clusters_odom, msg.header)
 
-    def update_tracks_and_publish(self, clusters_cartesian, header):
+    def update_tracks_and_publish(self, clusters_cartesian_odom, header):
         """
         Gestisce il ciclo di vita dei track e pubblica le predizioni e i marker di velocità.
+        I cluster in input sono già nel frame TARGET_FRAME.
         """
+        # --- MODIFICATO: Creiamo un nuovo header per i messaggi in uscita ---
+        output_header = Header()
+        output_header.stamp = header.stamp
+        output_header.frame_id = self.TARGET_FRAME
+
         # --- Associazione Dati ---
         matched_track_ids = set()
-        unmatched_cluster_indices = list(range(len(clusters_cartesian)))
+        unmatched_cluster_indices = list(range(len(clusters_cartesian_odom)))
 
         for track_id, track in self.tracked_obstacles.items():
             track_center = track.get_center()
@@ -168,8 +206,8 @@ class ObstacleDetectorNode(Node):
             best_match_idx = -1
 
             for i in unmatched_cluster_indices:
-                cluster_center_x = np.mean([p[0] for p in clusters_cartesian[i]])
-                cluster_center_y = np.mean([p[1] for p in clusters_cartesian[i]])
+                cluster_center_x = np.mean([p[0] for p in clusters_cartesian_odom[i]])
+                cluster_center_y = np.mean([p[1] for p in clusters_cartesian_odom[i]])
                 dist = math.hypot(track_center[0] - cluster_center_x, track_center[1] - cluster_center_y)
                 
                 if dist < min_dist:
@@ -177,7 +215,7 @@ class ObstacleDetectorNode(Node):
                     best_match_idx = i
             
             if best_match_idx != -1:
-                track.update(clusters_cartesian[best_match_idx], header.stamp)
+                track.update(clusters_cartesian_odom[best_match_idx], header.stamp)
                 matched_track_ids.add(track_id)
                 unmatched_cluster_indices.remove(best_match_idx)
 
@@ -193,7 +231,7 @@ class ObstacleDetectorNode(Node):
         ]
         for track_id in tracks_to_remove:
             delete_marker = Marker()
-            delete_marker.header = header
+            delete_marker.header = output_header
             delete_marker.ns = "velocity_vectors"
             delete_marker.id = track_id
             delete_marker.action = Marker.DELETE
@@ -203,7 +241,7 @@ class ObstacleDetectorNode(Node):
         # Crea nuovi track per i cluster non associati
         for i in unmatched_cluster_indices:
             new_id = self.next_obstacle_id
-            self.tracked_obstacles[new_id] = TrackedObstacle(new_id, clusters_cartesian[i], header.stamp, self.kf_params)
+            self.tracked_obstacles[new_id] = TrackedObstacle(new_id, clusters_cartesian_odom[i], header.stamp, self.kf_params)
             self.next_obstacle_id += 1
 
         # --- Predizione e Pubblicazione ---
@@ -222,7 +260,7 @@ class ObstacleDetectorNode(Node):
 
             # B. Prepara il marker della velocità (freccia) per RViz
             marker = Marker()
-            marker.header = header
+            marker.header = output_header
             marker.ns = "velocity_vectors"
             marker.id = track_id
             marker.type = Marker.ARROW
@@ -253,8 +291,7 @@ class ObstacleDetectorNode(Node):
         ]
         point_data = struct.pack('<%df' % (len(prediction_points) * 3), *[v for p in prediction_points for v in p])
         point_cloud_msg = PointCloud2(
-            header=header, height=1, width=len(prediction_points), is_dense=False,
-            is_bigendian=False, fields=fields, point_step=12, row_step=12 * len(prediction_points),
+            header=output_header, height=1, width=len(prediction_points), is_dense=False,            is_bigendian=False, fields=fields, point_step=12, row_step=12 * len(prediction_points),
             data=point_data)
         self.obstacle_pub.publish(point_cloud_msg)
 

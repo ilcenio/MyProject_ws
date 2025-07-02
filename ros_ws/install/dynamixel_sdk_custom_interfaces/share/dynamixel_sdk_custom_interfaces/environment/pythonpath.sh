@@ -1,3 +1,1 @@
-# generated from ament_package/template/environment_hook/pythonpath.sh.in
-
-ament_prepend_unique_value PYTHONPATH "$AMENT_CURRENT_PREFIX/lib/python3.12/site-packages"
+/root/ros_workspace/build/dynamixel_sdk_custom_interfaces/ament_cmake_environment_hooks/pythonpath.sh

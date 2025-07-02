@@ -1,0 +1,1 @@
+/root/ros_workspace/src/dynamic_obstacle_detector/launch/dynamic_nav.launch.py

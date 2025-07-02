@@ -1,4 +1,1 @@
----
-float32 pose_x
-float32 pose_y
-bool success
+/root/ros_workspace/src/turtlebot3_msgs/srv/Goal.srv
