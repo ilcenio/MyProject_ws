@@ -1,1 +1,1 @@
-python3-numpy:sensor_msgs:std_msgs:visualization_msgs
+python3-numpy:python3-scipy:python3-sklearn:sensor_msgs:std_msgs:visualization_msgs

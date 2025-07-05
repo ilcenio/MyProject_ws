@@ -1,14 +1,15 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, PointStamped
 import math
 import struct
 import numpy as np
+from sklearn.cluster import DBSCAN
 import tf2_ros
+from scipy.optimize import linear_sum_assignment
 from tf2_ros import TransformException
 import tf2_geometry_msgs
 
@@ -56,7 +57,10 @@ class TrackedObstacle:
         Z = np.mean(np.array(cluster_cartesian), axis=0)[:2].reshape(2, 1) # Misurazione
         y = Z - self.H @ self.X  # Errore di misurazione
         S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S) # Guadagno di Kalman
+        # Calcolo del Guadagno di Kalman in modo numericamente più stabile
+        # Invece di K = P @ H.T @ inv(S), risolviamo S @ K.T = (P @ H.T).T
+        K_T = np.linalg.solve(S, (self.P @ self.H.T).T)
+        K = K_T.T
         self.X = self.X + K @ y
         self.P = (np.eye(4) - K @ self.H) @ self.P
 
@@ -96,9 +100,12 @@ class ObstacleDetectorNode(Node):
         self.declare_parameter('prediction_steps', 5)
         # Parametri del Filtro di Kalman
         self.declare_parameter('kf.p', [0.1, 0.1, 10.0, 10.0])
-        self.declare_parameter('kf.r', [0.1, 0.1])
-        self.declare_parameter('kf.q', [0.01, 0.01, 0.1, 0.1])
+        self.declare_parameter('kf.r', [0.3, 0.3])
+        self.declare_parameter('kf.q', [0.001, 0.001, 0.01, 0.01])
         self.declare_parameter('target_frame', 'odom')
+        # Nuovi parametri per DBSCAN
+        self.declare_parameter('dbscan_eps', 0.2)
+        self.declare_parameter('dbscan_min_samples', 4)
 
         # --- Lettura dei Parametri ---
         self.MAX_TRACKING_DISTANCE = self.get_parameter('max_tracking_distance').get_parameter_value().double_value
@@ -106,6 +113,9 @@ class ObstacleDetectorNode(Node):
         self.PREDICTION_HORIZON = self.get_parameter('prediction_horizon').get_parameter_value().double_value
         self.PREDICTION_STEPS = self.get_parameter('prediction_steps').get_parameter_value().integer_value
         self.TARGET_FRAME = self.get_parameter('target_frame').get_parameter_value().string_value
+        # Lettura parametri DBSCAN
+        self.DBSCAN_EPS = self.get_parameter('dbscan_eps').get_parameter_value().double_value
+        self.DBSCAN_MIN_SAMPLES = self.get_parameter('dbscan_min_samples').get_parameter_value().integer_value
         
         # Memorizziamo i parametri del KF per passarli ai nuovi track
         self.kf_params = {
@@ -149,41 +159,33 @@ class ObstacleDetectorNode(Node):
         """
         # --- Trasformazione dei Punti nel Frame Fisso ---
         try:
-            # Chiediamo la trasformazione tra il frame del laser (es. 'base_scan') e il nostro frame target ('odom')
-            # Usiamo rclpy.time.Time() per ottenere la trasformazione più recente disponibile.
+            # Richiediamo la trasformazione dal frame del laser al frame target ('odom')
+            # USANDO IL TIMESTAMP DEL MESSAGGIO SCAN. Questo è fondamentale per la corretta sincronizzazione.
+            # L'uso di rclpy.time.Time() (ora attuale) causerebbe errori di percezione durante la rotazione del robot.
             transform = self.tf_buffer.lookup_transform(
                 self.TARGET_FRAME,
                 msg.header.frame_id,
-                rclpy.time.Time())
+                msg.header.stamp,
+                timeout=rclpy.duration.Duration(seconds=0.1)) # Aggiungiamo un timeout per robustezza
         except TransformException as ex:
             self.get_logger().warn(f'Non è stato possibile trasformare {msg.header.frame_id} in {self.TARGET_FRAME}: {ex}')
             return
 
-        # 1. Rileva i cluster di punti dal LaserScan (in coordinate polari)
-        polar_clusters = self.cluster_scan(msg)
+        # 1. Converti tutti i punti validi in coordinate cartesiane nel frame del LASER
+        points_in_laser_frame = self.convert_scan_to_cartesian(msg)
+        if not points_in_laser_frame:
+            # Se non ci sono punti validi, non c'è nulla da fare.
+            # Pubblichiamo un messaggio vuoto per cancellare i vecchi ostacoli se necessario.
+            self.update_tracks_and_publish([], msg.header)
+            return
 
-        # 2. Converte i cluster in coordinate cartesiane NEL FRAME TARGET ('odom')
-        cartesian_clusters_odom = []
-        for cluster in polar_clusters:
-            cart_cluster_odom = []
-            for r, theta in cluster:
-                # Crea un punto nel frame del laser
-                point_in_laser_frame = PointStamped()
-                point_in_laser_frame.header = msg.header
-                # Converte da polare a cartesiano (nel frame del laser)
-                point_in_laser_frame.point.x = r * math.cos(theta)
-                point_in_laser_frame.point.y = r * math.sin(theta)
-                point_in_laser_frame.point.z = 0.0
+        # 2. Applica DBSCAN per trovare i cluster (ancora nel frame del LASER)
+        clusters_in_laser_frame = self.cluster_points_dbscan(points_in_laser_frame)
 
-                # Trasforma il punto dal frame del laser al frame target ('odom')
-                point_in_odom_frame = tf2_geometry_msgs.do_transform_point(point_in_laser_frame, transform)
-            
-                cart_cluster_odom.append((point_in_odom_frame.point.x, point_in_odom_frame.point.y, 0.0))
+        # 3. Trasforma solo i punti dei cluster trovati nel frame TARGET ('odom')
+        cartesian_clusters_odom = self.transform_clusters(clusters_in_laser_frame, transform, msg.header)
         
-            if cart_cluster_odom:
-                cartesian_clusters_odom.append(cart_cluster_odom)
-        
-        # 3. Aggiorna i track, predici le traiettorie e pubblica
+        # 4. Aggiorna i track, predici le traiettorie e pubblica
         self.update_tracks_and_publish(cartesian_clusters_odom, msg.header)
 
     def update_tracks_and_publish(self, clusters_cartesian_odom, header):
@@ -191,39 +193,48 @@ class ObstacleDetectorNode(Node):
         Gestisce il ciclo di vita dei track e pubblica le predizioni e i marker di velocità.
         I cluster in input sono già nel frame TARGET_FRAME.
         """
-        # --- MODIFICATO: Creiamo un nuovo header per i messaggi in uscita ---
+        # --- BEST PRACTICE: Creiamo un nuovo header per i messaggi in uscita ---
         output_header = Header()
         output_header.stamp = header.stamp
         output_header.frame_id = self.TARGET_FRAME
 
-        # --- Associazione Dati ---
-        matched_track_ids = set()
-        unmatched_cluster_indices = list(range(len(clusters_cartesian_odom)))
+        # --- Associazione Dati con Algoritmo Ungherese (più robusto) ---
+        # Se non ci sono track o cluster, la logica di associazione non serve.
+        if not self.tracked_obstacles or not clusters_cartesian_odom:
+            unmatched_cluster_indices = list(range(len(clusters_cartesian_odom)))
+            matched_track_ids = set()
+        else:
+            track_ids = list(self.tracked_obstacles.keys())
+            track_centers = np.array([self.tracked_obstacles[tid].get_center() for tid in track_ids])
+            cluster_centers = np.array([np.mean(c, axis=0)[:2] for c in clusters_cartesian_odom])
 
-        for track_id, track in self.tracked_obstacles.items():
-            track_center = track.get_center()
-            min_dist = self.MAX_TRACKING_DISTANCE
-            best_match_idx = -1
+            # 1. Calcola la matrice dei costi (distanze)
+            cost_matrix = np.linalg.norm(track_centers[:, np.newaxis, :] - cluster_centers[np.newaxis, :, :], axis=2)
 
-            for i in unmatched_cluster_indices:
-                cluster_center_x = np.mean([p[0] for p in clusters_cartesian_odom[i]])
-                cluster_center_y = np.mean([p[1] for p in clusters_cartesian_odom[i]])
-                dist = math.hypot(track_center[0] - cluster_center_x, track_center[1] - cluster_center_y)
-                
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match_idx = i
+            # 2. Applica l'algoritmo di assegnazione
+            track_indices, cluster_indices = linear_sum_assignment(cost_matrix)
+
+            # 3. Filtra le associazioni valide (sotto la soglia di distanza)
+            matched_track_ids = set()
+            unmatched_cluster_indices = set(range(len(clusters_cartesian_odom)))
             
-            if best_match_idx != -1:
-                track.update(clusters_cartesian_odom[best_match_idx], header.stamp)
-                matched_track_ids.add(track_id)
-                unmatched_cluster_indices.remove(best_match_idx)
+            for track_idx, cluster_idx in zip(track_indices, cluster_indices):
+                if cost_matrix[track_idx, cluster_idx] < self.MAX_TRACKING_DISTANCE:
+                    track_id = track_ids[track_idx]
+                    self.tracked_obstacles[track_id].update(clusters_cartesian_odom[cluster_idx], header.stamp)
+                    matched_track_ids.add(track_id)
+                    if cluster_idx in unmatched_cluster_indices:
+                        unmatched_cluster_indices.remove(cluster_idx)
+
+            unmatched_cluster_indices = list(unmatched_cluster_indices)
 
         # --- Gestione Ciclo di Vita ---
         marker_array = MarkerArray()
         current_time_sec = header.stamp.sec + header.stamp.nanosec / 1e9
 
         # Rimuovi i track vecchi e crea i marker di CANCELLAZIONE per pulire RViz
+        # Nota: la logica qui è corretta, ma ora `matched_track_ids` è calcolato sopra.
+        # Il set di track da rimuovere sono quelli non presenti in `matched_track_ids`
         tracks_to_remove = [
             tid for tid, track in self.tracked_obstacles.items() 
             if tid not in matched_track_ids and 
@@ -295,47 +306,76 @@ class ObstacleDetectorNode(Node):
             data=point_data)
         self.obstacle_pub.publish(point_cloud_msg)
 
-    def cluster_scan(self, scan_msg, cluster_dist_threshold=0.1):
-        """
-        Raggruppa i punti dello scan in cluster.
-        Due punti appartengono allo stesso cluster se la loro distanza è inferiore a una soglia.
-        """
-        clusters = []
-        current_cluster = []
-        
-        for i in range(1, len(scan_msg.ranges)):
-            if not (math.isfinite(scan_msg.ranges[i]) and math.isfinite(scan_msg.ranges[i-1])):
-                if current_cluster:
-                    if len(current_cluster) > 3:
-                        clusters.append(current_cluster)
-                    current_cluster = []
+    def convert_scan_to_cartesian(self, scan_msg):
+        """Converte i range di un LaserScan in una lista di punti cartesiani [x, y]."""
+        points = []
+        for i, r in enumerate(scan_msg.ranges):
+            # Ignora i punti non validi (inf, nan) e quelli fuori dal range del sensore
+            if not math.isfinite(r) or r < scan_msg.range_min or r > scan_msg.range_max:
                 continue
+            
+            angle = scan_msg.angle_min + i * scan_msg.angle_increment
+            x = r * math.cos(angle)
+            y = r * math.sin(angle)
+            points.append([x, y])
+        return points
+    
+    def cluster_points_dbscan(self, points):
+        """
+        Usa DBSCAN per raggruppare una lista di punti in coordinate cartesiane.
+        Restituisce una lista di cluster, dove ogni cluster è una lista di punti.
+        """
+        if not points:
+            return []
 
-            dist_between_points = math.sqrt(
-                scan_msg.ranges[i]**2 + scan_msg.ranges[i-1]**2 - 
-                2 * scan_msg.ranges[i] * scan_msg.ranges[i-1] * 
-                math.cos(scan_msg.angle_increment)
-            )
-
-            if dist_between_points < cluster_dist_threshold:
-                if not current_cluster:
-                    angle = scan_msg.angle_min + (i-1) * scan_msg.angle_increment
-                    current_cluster.append((scan_msg.ranges[i-1], angle))
-                
-                angle = scan_msg.angle_min + i * scan_msg.angle_increment
-                current_cluster.append((scan_msg.ranges[i], angle))
-            else:
-                if current_cluster:
-                    if len(current_cluster) > 3:
-                        clusters.append(current_cluster)
-                    current_cluster = []
+        points_np = np.array(points)
         
-        if current_cluster and len(current_cluster) > 3:
-            clusters.append(current_cluster)
+        # Applica DBSCAN
+        db = DBSCAN(eps=self.DBSCAN_EPS, min_samples=self.DBSCAN_MIN_SAMPLES).fit(points_np)
+        labels = db.labels_
+
+        # Raggruppa i punti per etichetta di cluster
+        unique_labels = set(labels)
+        clusters = []
+        for k in unique_labels:
+            if k == -1:
+                # -1 è l'etichetta per il rumore, lo ignoriamo
+                continue
+            
+            class_member_mask = (labels == k)
+            cluster_points = points_np[class_member_mask]
+            clusters.append(cluster_points.tolist())  # Converte in lista di liste
             
         return clusters
 
+    def transform_clusters(self, clusters_in_laser_frame, transform_stamped, header):
+        """Trasforma una lista di cluster dal frame del laser al frame target."""
+        transformed_clusters = []
+        # Estrarre la traslazione e la rotazione (come quaternione) dalla trasformazione
+        t = transform_stamped.transform.translation
+        q = transform_stamped.transform.rotation
+        
+        # Creare la matrice di rotazione 3x3 dal quaternione
+        # Questo è più efficiente che usare tf2_geometry_msgs per ogni punto
+        # Nota: questa è una rotazione 3D, ma la applicheremo a punti 2D (z=0)
+        # La formula è standard per la conversione da quaternione a matrice di rotazione
+        rot_matrix = np.array([
+            [1 - 2*q.y**2 - 2*q.z**2, 2*q.x*q.y - 2*q.z*q.w, 2*q.x*q.z + 2*q.y*q.w],
+            [2*q.x*q.y + 2*q.z*q.w, 1 - 2*q.x**2 - 2*q.z**2, 2*q.y*q.z - 2*q.x*q.w],
+            [2*q.x*q.z - 2*q.y*q.w, 2*q.y*q.z + 2*q.x*q.w, 1 - 2*q.x**2 - 2*q.y**2]
+        ])
+        translation_vec = np.array([t.x, t.y, t.z])
 
+        for cluster in clusters_in_laser_frame:
+            if not cluster:
+                continue
+            # Converti il cluster in un array numpy [N, 2] e aggiungi una colonna di zeri -> [N, 3]
+            points_np = np.hstack([np.array(cluster), np.zeros((len(cluster), 1))])
+            # Applica la rotazione e poi la traslazione a tutti i punti in una sola operazione
+            transformed_points = points_np @ rot_matrix.T + translation_vec
+            transformed_clusters.append(transformed_points[:, :3].tolist()) # Manteniamo (x, y, z)
+        return transformed_clusters
+    
 def main(args=None):
     rclpy.init(args=args)
     obstacle_detector_node = ObstacleDetectorNode()

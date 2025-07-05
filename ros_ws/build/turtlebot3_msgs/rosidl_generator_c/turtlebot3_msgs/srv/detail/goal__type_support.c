@@ -5,8 +5,8 @@
 #include <string.h>
 
 #include "rosidl_typesupport_interface/macros.h"
-#include "turtlebot3_msgs/srv/detail/goal__type_support.h"
 #include "turtlebot3_msgs/srv/detail/goal__struct.h"
+#include "turtlebot3_msgs/srv/detail/goal__type_support.h"
 #include "turtlebot3_msgs/srv/detail/goal__functions.h"
 
 #ifdef __cplusplus

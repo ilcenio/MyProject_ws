@@ -44,8 +44,15 @@ def generate_launch_description():
         executable='obstacle_detector_node',
         name='obstacle_detector_node',
         output='screen',
-        parameters=[detector_params_path])
-
+        parameters=[
+            detector_params_path,
+            # --- SOVRASCRITTURA PER IL TUNING DEI PEDONI ---
+            # Aumentiamo 'eps' per unire le due gambe di un pedone in un unico cluster.
+            # Un valore tra 0.3 e 0.4 metri è un buon punto di partenza.
+            {'dbscan_eps': 0.35},
+            # Potremmo voler aumentare i campioni minimi per essere sicuri di tracciare una persona intera
+            {'dbscan_min_samples': 5}
+        ])
 
     # 3. Avvio di Nav2 con i nostri parametri personalizzati
     start_ros2_navigation_cmd = IncludeLaunchDescription(
